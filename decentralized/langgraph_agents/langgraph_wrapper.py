@@ -40,12 +40,27 @@ class StateGraph:
         current = start
         iters = 0
         history: List[Dict[str, Any]] = []
+
+        # Debug: print graph topology and start info
+        try:
+            print(f"[StateGraph] start='{start}', max_iters={max_iters}")
+            print(f"[StateGraph] nodes={list(self.nodes.keys())}")
+            print(f"[StateGraph] edges={[ (e.src,e.dst) for e in self.edges ]}")
+        except Exception:
+            pass
+
         while current and iters < max_iters:
             iters += 1
             node = self.nodes.get(current)
             if node is None:
+                print(f"[StateGraph] stopping: node '{current}' not found")
                 break
-            out = node.run(state)
+            try:
+                out = node.run(state)
+            except Exception as e:
+                print(f"[StateGraph] node '{current}' raised: {e}")
+                break
+
             # record history entry for this node invocation
             history.append({"iteration": iters, "node": current, "output": out})
 
@@ -61,12 +76,14 @@ class StateGraph:
                         if e.condition(state):
                             next_node = e.dst
                             break
-                    except Exception:
+                    except Exception as e:
+                        print(f"[StateGraph] edge condition from {e.src}->{e.dst} raised: {e}")
                         continue
 
             if next_node is None:
-                # stop if no outgoing edge matched
+                print(f"[StateGraph] stopping: no outgoing edge matched from '{current}'")
                 break
             current = next_node
 
+        print(f"[StateGraph] finished after {iters} iterations")
         return {"state": state, "history": history}
