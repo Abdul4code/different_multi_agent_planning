@@ -71,13 +71,21 @@ def run_tests(command: str = "pytest -q") -> Dict:
     """
     # Detect if we're in a virtualenv or if pytest should be run via python -m pytest
     # Try to find the project's virtualenv python binary
-    # Look for env/bin/python or .venv/bin/python relative to the script location
-    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Look for env/bin/python relative to various locations
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # centralized/
+    project_root = os.path.dirname(script_dir)  # different_multi_agent_planning/
+    cwd = os.getcwd()  # current working directory (may be the target repo)
+    
     venv_python = None
-    for candidate in ['env/bin/python', '.venv/bin/python', 'venv/bin/python']:
-        path = os.path.join(script_dir, candidate)
-        if os.path.isfile(path):
-            venv_python = path
+    # Search in project root, script_dir, and cwd
+    search_dirs = [project_root, script_dir, cwd]
+    for base_dir in search_dirs:
+        for candidate in ['env/bin/python', '.venv/bin/python', 'venv/bin/python']:
+            path = os.path.join(base_dir, candidate)
+            if os.path.isfile(path):
+                venv_python = path
+                break
+        if venv_python:
             break
     
     # If command starts with 'pytest', replace it with python -m pytest
@@ -105,10 +113,19 @@ def run_tests(command: str = "pytest -q") -> Dict:
     # Look for lines like '== 3 passed, 1 failed in 0.12s ==' or '10 passed in 0.01s'
     import re
     
-    # Try to find summary with == markers first
-    m = re.search(r"==\s*(.*?)\s*==", out)
-    if m:
-        summary = m.group(1)
+    # Find the LAST summary line with == markers that contains result counts
+    # This avoids matching '== FAILURES ==' or '== short test summary info ==' etc.
+    summary = None
+    for line in reversed(out.splitlines()):
+        # Look for lines like "=== 4 failed, 6 passed in 0.12s ===" or "== 10 passed in 0.01s =="
+        if re.search(r"=+.*(\d+\s+(passed|failed|error)).*=+", line):
+            # Extract the content between == markers
+            m = re.search(r"=+\s*(.*?)\s*=+", line)
+            if m:
+                summary = m.group(1)
+                break
+    
+    if summary:
         # split by comma
         parts = [p.strip() for p in summary.split(",")]
         for p in parts:

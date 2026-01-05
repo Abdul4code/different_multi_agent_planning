@@ -113,10 +113,19 @@ def run_tests(command: str = "pytest -q") -> Dict:
     # Look for lines like '== 3 passed, 1 failed in 0.12s ==' or '10 passed in 0.01s'
     import re
     
-    # Try to find summary with == markers first
-    m = re.search(r"==\s*(.*?)\s*==", out)
-    if m:
-        summary = m.group(1)
+    # Find the LAST summary line with == markers that contains result counts
+    # This avoids matching '== FAILURES ==' or '== short test summary info ==' etc.
+    summary = None
+    for line in reversed(out.splitlines()):
+        # Look for lines like "=== 4 failed, 6 passed in 0.12s ===" or "== 10 passed in 0.01s =="
+        if re.search(r"=+.*(\d+\s+(passed|failed|error)).*=+", line):
+            # Extract the content between == markers
+            m = re.search(r"=+\s*(.*?)\s*=+", line)
+            if m:
+                summary = m.group(1)
+                break
+    
+    if summary:
         # split by comma
         parts = [p.strip() for p in summary.split(",")]
         for p in parts:
