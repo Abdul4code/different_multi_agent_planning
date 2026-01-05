@@ -43,7 +43,7 @@ except Exception:
                 "model": self.model,
                 "messages": payload_msgs,
                 "temperature": self.temperature,
-            }, timeout=60)
+            }, timeout=180)
             resp.raise_for_status()
             j = resp.json()
             # Create a simple response object with .content
