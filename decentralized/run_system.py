@@ -44,102 +44,34 @@ def build_decentralized_graph(
     g.add_node(Node('writer', lambda s: writer.run(s)))
     g.add_node(Node('perf', lambda s: perf.run(s)))
     
-    # Create a coordinator node that checks termination conditions
-    # This is NOT a planner - it only checks if we should continue
-    def coordinator_check(state: Dict) -> Dict:
-        """Check termination conditions based on state convergence.
-        
-        This is not a planning agent - it's a pure state observer.
-        """
-        iteration = state.get('iteration', 0)
-        max_iterations = state.get('max_iterations', 20)
-        
-        test_results = state.get('test_results', {})
-        total_tests = test_results.get('total_tests', 0)
-        failed_tests = test_results.get('failed', 0)
-        
-        # Determine if system should continue
-        should_continue = True
-        termination_reason = None
-        
-        if total_tests > 0 and failed_tests == 0:
-            should_continue = False
-            termination_reason = "All tests passing"
-        elif iteration >= max_iterations:
-            should_continue = False
-            termination_reason = "Max iterations reached"
-        
-        return {
-            'iteration': iteration + 1,
-            'should_continue': should_continue,
-            'termination_reason': termination_reason,
-        }
+    # Helper to check if all tests pass (for early termination)
+    def all_tests_pass(st):
+        tr = st.get('test_results') or {}
+        total = tr.get('total_tests', 0)
+        failed = tr.get('failed', 0)
+        return total > 0 and failed == 0
     
-    g.add_node(Node('coordinator', coordinator_check))
-    
-    # Define decentralized edges based on state conditions
-    # Pattern: Each agent connects to coordinator, coordinator connects to next agent
-    
-    # Start with analyzer (initial code analysis)
-    # analyzer -> coordinator
-    g.add_edge('analyzer', 'coordinator', lambda st: True)
-    
-    # coordinator -> testrunner (if analysis complete and tests need to run)
-    def need_test_run(st):
-        # Run tests if no results exist OR code was modified
-        no_results = st.get('test_results') is None
-        code_modified = st.get('code_modified', False)
-        return st.get('should_continue', True) and (no_results or code_modified)
-    
-    g.add_edge('coordinator', 'testrunner', need_test_run)
-    
-    # testrunner -> coordinator
-    g.add_edge('testrunner', 'coordinator', lambda st: True)
-    
-    # coordinator -> debugger (if tests failed and no pending fixes)
-    def need_debug(st):
-        has_test_results = st.get('test_results') is not None
-        tests_failed = st.get('test_results', {}).get('failed', 0) > 0
-        no_pending = not st.get('pending_fixes')
-        return st.get('should_continue', True) and has_test_results and tests_failed and no_pending
-    
-    g.add_edge('coordinator', 'debugger', need_debug)
-    
-    # debugger -> coordinator
-    g.add_edge('debugger', 'coordinator', lambda st: True)
-    
-    # coordinator -> writer (if pending fixes or optimizations exist)
-    def need_write(st):
-        has_fixes = bool(st.get('pending_fixes'))
-        has_opts = bool(st.get('optimization_suggestions'))
-        return st.get('should_continue', True) and (has_fixes or has_opts)
-    
-    g.add_edge('coordinator', 'writer', need_write)
-    
-    # writer -> coordinator
-    g.add_edge('writer', 'coordinator', lambda st: True)
-    
-    # coordinator -> perf (if performance mode and tests passing)
-    def need_perf(st):
-        user_req = st.get('user_request', '').lower()
-        is_perf_mode = 'perf' in user_req or 'optimi' in user_req
-        tests_pass = st.get('test_results', {}).get('failed', 0) == 0
-        has_tests = st.get('test_results', {}).get('total_tests', 0) > 0
-        no_pending_opts = not st.get('optimization_suggestions')
-        return st.get('should_continue', True) and is_perf_mode and tests_pass and has_tests and no_pending_opts
-    
-    g.add_edge('coordinator', 'perf', need_perf)
-    
-    # perf -> coordinator
-    g.add_edge('perf', 'coordinator', lambda st: True)
-    
-    # coordinator -> analyzer (loop back for re-analysis - this should rarely trigger)
-    def need_reanalyze(st):
-        # Only re-analyze if we're stuck and nothing else to do
-        return False  # Disabled to prevent loops
-    
-    g.add_edge('coordinator', 'analyzer', need_reanalyze)
-    
+    # Decentralized wiring (no central coordinator)
+    # Agents are connected directly. Each agent decides whether to act via should_act().
+    # Ordering here drives the execution order, but agents may skip if should_act() is False.
+
+    # After analysis, run tests
+    g.add_edge('analyzer', 'testrunner', lambda st: True)
+
+    # After tests, check if we should continue or stop (early termination if all pass)
+    # If tests fail, go to debugger; if all pass, go to perf (which will likely skip) then stop
+    g.add_edge('testrunner', 'debugger', lambda st: not all_tests_pass(st))
+    g.add_edge('testrunner', 'perf', lambda st: all_tests_pass(st))  # Only go to perf if tests pass
+
+    # Debugger suggests fixes if failures exist
+    g.add_edge('debugger', 'writer', lambda st: bool(st.get('pending_fixes')))
+    # If debugger has nothing to do, stop (no edge matches = termination)
+
+    # Writer applies fixes then trigger tests again
+    g.add_edge('writer', 'testrunner', lambda st: True)
+
+    # Perf analyzer runs after all tests pass, then stops (no outgoing edge = termination)
+
     return g
 
 
@@ -191,30 +123,68 @@ def main():
     start_time = time.time()
 
     # Execute graph (starts at analyzer)
-    result = graph.run('analyzer', initial_state=initial_state, max_iters=args.max_iterations * 6)  # *6 because each iteration involves multiple agent nodes
+    # max_iters = exact number of node invocations allowed
+    result = graph.run('analyzer', initial_state=initial_state, max_iters=args.max_iterations)
 
     # Track end time
     end_time = time.time()
     elapsed_seconds = end_time - start_time
 
-    # Extract final state
-    final_state = result.get('state', {})
-    history = result.get('history', [])
+    # Extract final state and history
+    final_state = result.get('state', {}) or {}
+    history = result.get('history', []) or []
 
-    # Get final test results
-    final_test_results = final_state.get('test_results', {})
+    # Always run tests one final time to capture actual end state
+    # This ensures the changelog reflects reality even if the graph stopped mid-cycle
+    final_test_results = tools.run_tests("pytest -q")
+    # Append to history so changelog writer finds it
+    history.append({
+        'iteration': len(history) + 1,
+        'node': 'testrunner (final)',
+        'output': {'test_results': final_test_results}
+    })
+
+    # Use history length as authoritative iteration count (node invocations)
+    iterations = len(history)
+
     total_tests = final_test_results.get('total_tests', 0)
     passed_tests = final_test_results.get('passed', 0)
     failed_tests = final_test_results.get('failed', 0)
     failed_test_names = final_test_results.get('failed_test_names', [])
 
-    # Print results
+    # Aggregate unique failing test names seen during the whole run
+    aggregated_failed = set()
+    for entry in history:
+        output = entry.get('output', {})
+        if isinstance(output, dict):
+            # testrunner may return data under 'last_test_run' or 'test_results'
+            tr = output.get('last_test_run') or output.get('test_results') or {}
+            if isinstance(tr, dict):
+                names = tr.get('failed_test_names') or tr.get('failed_tests') or []
+                try:
+                    for n in names:
+                        aggregated_failed.add(n)
+                except Exception:
+                    pass
+
+    aggregated_failed_list = sorted(aggregated_failed)
+    aggregated_failed_count = len(aggregated_failed_list)
+
+    # Determine termination reason
+    if total_tests > 0 and failed_tests == 0:
+        termination_reason = "All tests passing"
+    elif iterations >= args.max_iterations:
+        termination_reason = "Max iterations reached"
+    else:
+        termination_reason = "No matching edge (graph converged)"
+
+    # Print results (use history-derived iterations)
     print(f"\n{'='*60}")
     print(f"EXECUTION COMPLETE")
     print(f"{'='*60}")
-    print(f"Elapsed Time: {elapsed_seconds:.2f} seconds")
-    print(f"Iterations: {final_state.get('iteration', 0)}")
-    print(f"Termination Reason: {final_state.get('termination_reason', 'Unknown')}")
+    print(f"Execution Time: {elapsed_seconds:.2f} seconds")
+    print(f"Iterations: {iterations}")
+    print(f"Termination Reason: {termination_reason}")
     print(f"\nTest Results:")
     print(f"  Total Tests: {total_tests}")
     print(f"  Passed: {passed_tests}")
@@ -236,17 +206,25 @@ def main():
     lines.append("# Decentralized Multi-Agent System Execution Log\n")
     lines.append(f"**User Request:** {args.user}\n")
     lines.append(f"**Execution Time:** {elapsed_seconds:.2f} seconds")
-    lines.append(f"**Iterations:** {final_state.get('iteration', 0)}")
-    lines.append(f"**Termination Reason:** {final_state.get('termination_reason', 'Unknown')}\n")
+    lines.append(f"**Iterations:** {iterations}")
+    lines.append(f"**Termination Reason:** {termination_reason}\n")
     
     lines.append("## Final Test Results\n")
     lines.append(f"- **Total Tests:** {total_tests}")
     lines.append(f"- **Passed:** {passed_tests}")
     lines.append(f"- **Failed:** {failed_tests}\n")
-    
+
+    # If tests failed, include the final run's failing tests and also aggregated unique failures
     if failed_tests > 0:
-        lines.append("### Failing Tests\n")
-        for test_name in failed_test_names:
+        if failed_test_names:
+            lines.append("### Failing Tests (final run)\n")
+            for test_name in failed_test_names:
+                lines.append(f"- `{test_name}`")
+            lines.append("")
+
+    if aggregated_failed_count > 0:
+        lines.append("### Detected failing tests (unique across run)\n")
+        for test_name in aggregated_failed_list:
             lines.append(f"- `{test_name}`")
         lines.append("")
     
@@ -295,7 +273,7 @@ def main():
         'failed_tests': failed_tests,
         'failed_test_names': failed_test_names,
         'elapsed_seconds': elapsed_seconds,
-        'iterations': final_state.get('iteration', 0),
+        'iterations': iterations,
         'modified_files': final_state.get('modified_files', []),
     }
 
