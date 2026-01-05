@@ -1,4 +1,16 @@
-"""Entry point to run the centralized LangGraph multi-agent system.
+"""Entry point for the CANONICAL CENTRALIZED PLANNER multi-agent system.
+
+CANONICAL CENTRALIZED PLANNER (Manager-Worker) Architecture:
+============================================================
+1. Single Planning Authority: PlannerAgent produces COMPLETE plan in ONE LLM call
+2. Stateless Workers: Execute assigned tasks without re-planning
+3. Linear Plan Representation: Simple task list (no DAG, no recursive refinement)
+4. Synchronous Control Flow: Sequential execution with planner aggregation
+
+Execution Flow:
+  User Goal → Planner (ONE LLM call) → Task List → Workers → Results → Done
+                                                        ↓
+                                              (If failure: Replan in Planner ONLY)
 
 Produces a unified CHANGELOG_AGENT.md with the same structure as the decentralized
 version so both can be parsed by the same script.
@@ -12,39 +24,29 @@ from langgraph_agents import agents
 from langgraph_agents import tools
 
 
-def build_graph(planner: agents.PlannerAgent, analyzer: agents.CodeAnalyzerAgent, writer: agents.CodeWriterAgent,
-                testrunner: agents.TestRunnerAgent, debugger: agents.DebuggerAgent, perf: agents.PerformanceAnalyzerAgent):
+def build_graph(planner: agents.PlannerAgent, analyzer: agents.CodeAnalyzerAgent, 
+                writer: agents.CodeWriterAgent, testrunner: agents.TestRunnerAgent, 
+                debugger: agents.DebuggerAgent, perf: agents.PerformanceAnalyzerAgent):
+    """Build the execution graph with worker nodes.
+    
+    Note: In the canonical centralized model, edges are implicit in the plan.
+    The planner decides the sequence, not the graph structure.
+    """
     g = StateGraph()
 
-    g.add_node(Node('planner', lambda s: planner.run(s)))
-    g.add_node(Node('analyzer', lambda s: analyzer.run(s)))
+    # Register worker nodes (stateless executors)
+    g.add_node(Node('analyze', lambda s: analyzer.run(s)))
     g.add_node(Node('writer', lambda s: writer.run(s)))
     g.add_node(Node('testrunner', lambda s: testrunner.run(s)))
-    g.add_node(Node('debugger', lambda s: debugger.run(s)))
-    g.add_node(Node('perf', lambda s: perf.run(s)))
-
-    g.add_edge('planner', 'analyzer', lambda st: st.get('next_action') in ('analyze', 'start'))
-    g.add_edge('analyzer', 'planner', lambda st: True)
-
-    g.add_edge('planner', 'writer', lambda st: st.get('next_action') == 'write')
-    g.add_edge('writer', 'testrunner', lambda st: True)
-    g.add_edge('testrunner', 'planner', lambda st: True)
-
-    g.add_edge('planner', 'testrunner', lambda st: st.get('next_action') == 'testrunner')
-    g.add_edge('testrunner', 'planner', lambda st: True)
-
-    g.add_edge('planner', 'debugger', lambda st: st.get('next_action') == 'debug')
-    g.add_edge('debugger', 'writer', lambda st: bool(st.get('fix_instructions')))
-    g.add_edge('debugger', 'planner', lambda st: not st.get('fix_instructions'))
-
-    g.add_edge('planner', 'perf', lambda st: st.get('next_action') == 'profile')
-    g.add_edge('perf', 'planner', lambda st: True)
+    g.add_node(Node('debug', lambda s: debugger.run(s)))
+    g.add_node(Node('profile', lambda s: perf.run(s)))
 
     return g
 
 
 def write_unified_changelog(path: str, meta: dict, final_test_run: dict, aggregated_failed_list: list,
                             history: list, modified_files: list, agent_messages: list):
+    """Write execution log documenting the canonical centralized planner run."""
     # Use history length as authoritative iteration count (node invocations)
     iterations = len(history or [])
 
@@ -77,10 +79,22 @@ def write_unified_changelog(path: str, meta: dict, final_test_run: dict, aggrega
 
     lines = []
     lines.append("# Centralized Multi-Agent System Execution Log\n")
+    lines.append("## Architecture: CANONICAL CENTRALIZED PLANNER (Manager-Worker)\n")
+    lines.append("Key Properties:")
+    lines.append("- ✓ Single Planning Authority: ONE LLM call produces complete plan")
+    lines.append("- ✓ Stateless Workers: Execute tasks without modifying plan")
+    lines.append("- ✓ Linear Plan Representation: Simple task list")
+    lines.append("- ✓ Synchronous Control Flow: Sequential execution\n")
+    
     lines.append(f"**User Request:** {meta.get('user_request', '')}")
     lines.append(f"**Mode:** {meta.get('mode', 'N/A')}")
-    lines.append(f"**Iterations:** {iterations}")
-    lines.append(f"**Planner notes:** {meta.get('planner_notes', '')}")
+    
+    # Document the plan (key evidence of canonical centralized planning)
+    original_plan = meta.get('original_plan', [])
+    lines.append(f"**Original Plan (from ONE LLM call):** `{original_plan}`")
+    lines.append(f"**Replan Count:** {meta.get('replan_count', 0)}")
+    lines.append(f"**Total Steps Executed:** {iterations}")
+    lines.append(f"**Planner Notes:** {meta.get('planner_notes', '')}")
     lines.append(f"**Execution Time:** {meta.get('elapsed_seconds', 0.0):.2f} seconds\n")
 
     lines.append("## Final Test Results\n")
@@ -132,10 +146,13 @@ def write_unified_changelog(path: str, meta: dict, final_test_run: dict, aggrega
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--user', '-u', type=str, default='Fix failing tests')
-    parser.add_argument('--repo', '-r', type=str, default=None)
-    parser.add_argument('--max-iterations', '-m', type=int, default=8)
+    parser = argparse.ArgumentParser(description="Canonical Centralized Planner Multi-Agent System")
+    parser.add_argument('--user', '-u', type=str, default='Fix failing tests',
+                        help='User request/goal for the system')
+    parser.add_argument('--repo', '-r', type=str, default=None,
+                        help='Path to the repository to work on')
+    parser.add_argument('--max-iterations', '-m', type=int, default=8,
+                        help='Maximum iterations/steps allowed')
     args = parser.parse_args()
 
     if args.repo:
@@ -146,6 +163,7 @@ def main():
 
     base_url = os.environ.get('OPENAI_API_BASE', 'http://localhost:11434/v1')
 
+    # Initialize agents
     planner = agents.PlannerAgent(base_url=base_url)
     analyzer = agents.CodeAnalyzerAgent(base_url=base_url)
     writer = agents.CodeWriterAgent(base_url=base_url)
@@ -153,23 +171,60 @@ def main():
     debugger = agents.DebuggerAgent(base_url=base_url)
     perf = agents.PerformanceAnalyzerAgent(base_url=base_url)
 
+    # Build execution graph (workers only - planner is separate)
     graph = build_graph(planner, analyzer, writer, testrunner, debugger, perf)
 
+    # Initial state for planning
     initial_state = {
         'user_request': args.user,
-        'next_action': 'analyze',
-        'iteration': 0,
         'modified_files': [],
         'max_iterations': int(args.max_iterations),
     }
 
+    print("=" * 60)
+    print("CANONICAL CENTRALIZED PLANNER - Multi-Agent System")
+    print("=" * 60)
+    print(f"User Request: {args.user}")
+    print(f"Max Iterations: {args.max_iterations}")
+    print()
+
     start_time = time.time()
-    result = graph.run('planner', initial_state=initial_state, max_iters=int(args.max_iterations))
+    
+    # STEP 1: Planner creates COMPLETE plan in ONE LLM call
+    print("Step 1: Creating execution plan (ONE LLM call)...")
+    plan_result = planner.create_plan(initial_state)
+    initial_state.update(plan_result)
+    
+    plan = plan_result.get("plan", ["testrunner", "debug", "writer", "testrunner", "done"])
+    print(f"  Mode: {plan_result.get('mode', 'debug')}")
+    print(f"  Plan: {plan}")
+    print(f"  Notes: {plan_result.get('planner_notes', '')}")
+    print()
+    
+    # STEP 2: Execute the plan sequentially (workers don't modify plan)
+    print("Step 2: Executing plan (workers execute sequentially)...")
+    result = graph.run(
+        start=None,  # Not used in plan mode
+        initial_state=initial_state,
+        max_iters=int(args.max_iterations),
+        planner=planner,  # For replanning if needed
+        plan=plan  # The pre-defined plan
+    )
+    
     end_time = time.time()
     elapsed_seconds = end_time - start_time
 
     final_state = result.get('state', {})
     history = result.get('history', [])
+
+    # Print execution summary
+    print()
+    print("Execution History:")
+    for entry in history:
+        node = entry.get('node', 'unknown')
+        iteration = entry.get('iteration', '?')
+        print(f"  [{iteration}] {node}")
+    print()
 
     # Always run tests one final time to capture actual end state
     # This ensures the changelog reflects reality even if the graph stopped mid-cycle
@@ -185,6 +240,15 @@ def main():
     passed_tests = final_test_run.get('passed', 0)
     failed_tests = final_test_run.get('failed', 0)
 
+    print("=" * 60)
+    print("FINAL RESULTS")
+    print("=" * 60)
+    print(f"Total Tests: {total_tests}")
+    print(f"Passed: {passed_tests}")
+    print(f"Failed: {failed_tests}")
+    print(f"Time: {elapsed_seconds:.2f} seconds")
+    print()
+
     aggregated_failed = set()
     for entry in history:
         out = entry.get('output', {})
@@ -197,11 +261,12 @@ def main():
 
     aggregated_failed_list = sorted(aggregated_failed)
 
-    # metadata for changelog
+    # metadata for changelog - include original plan for documentation
     meta = {
         'user_request': args.user,
         'mode': final_state.get('mode', 'N/A'),
-        'iteration': final_state.get('iteration', 0),
+        'original_plan': final_state.get('original_plan', plan),
+        'replan_count': final_state.get('replan_count', 0),
         'planner_notes': final_state.get('planner_notes', ''),
         'elapsed_seconds': elapsed_seconds,
     }
@@ -209,7 +274,8 @@ def main():
     # write unified changelog to centralized folder
     changelog_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'CHANGELOG_AGENT.md')
     write_unified_changelog(changelog_path, meta, final_test_run, aggregated_failed_list,
-                            history, final_state.get('modified_files', []), final_state.get('agent_messages', []))
+                            history, final_state.get('modified_files', final_state.get('patched_files', [])), 
+                            final_state.get('agent_messages', []))
 
     print(f"Run complete. Wrote {changelog_path}")
 
@@ -219,4 +285,6 @@ if __name__ == '__main__':
         main()
     except Exception as e:
         import sys
+        import traceback
         print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc()

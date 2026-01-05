@@ -1,8 +1,17 @@
 """Agent implementations for the centralized multi-agent system.
 
-Each agent is implemented as a single callable object. Worker agents are
-strictly bounded: they perform one action and return results. PlannerAgent
-is the only agent that decides flow and selects worker agents.
+CANONICAL CENTRALIZED PLANNER (Manager-Worker Architecture)
+===========================================================
+This implementation follows the canonical centralized planning pattern:
+
+1. Single Planning Authority: PlannerAgent produces a COMPLETE task plan
+   in ONE LLM call (goal decomposition + task sequencing)
+2. Stateless Workers: Workers execute assigned tasks without re-planning
+3. Linear Plan Representation: Plan is a simple task list
+4. Synchronous Control Flow: Sequential execution with planner aggregation
+
+Key discriminator: The planner decides WHAT should be done and in WHAT ORDER
+upfront, not incrementally.
 """
 from typing import Dict, Any, List
 import os
@@ -64,11 +73,12 @@ from . import tools
 LLM_SETTINGS = {
     "model": "qwen2.5:7b",
     "temperature": 0.2,
-    # ChatOpenAI in LangChain supports openai_api_base via environment or constructor args in some versions.
 }
 
 
 class BaseAgent:
+    """Base class for all agents with LLM communication."""
+    
     def __init__(self, system_prompt: str, name: str = "agent", base_url: str = "http://localhost:11434/v1"):
         self.name = name
         self.system_prompt = system_prompt
@@ -87,90 +97,212 @@ class BaseAgent:
 
 
 class PlannerAgent(BaseAgent):
-    """Planner is the only agent that plans, keeps global state, and chooses modes.
-
-    It returns a dict that the graph runner uses as authoritative state.
+    """Central Planner: The ONLY agent that creates plans.
+    
+    CANONICAL BEHAVIOR:
+    - Produces a COMPLETE task plan in ONE LLM call
+    - Workers execute tasks without modifying the plan
+    - Replanning ONLY occurs if execution fails unexpectedly
+    
+    Plan format: List of tasks like ["testrunner", "debug", "writer", "testrunner"]
     """
 
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
-        super().__init__(system_prompt="You are PlannerAgent: sole planner and controller. Always produce a JSON dict with keys: mode, next_action, notes, modified_files (list).", name="Planner", base_url=base_url)
+        super().__init__(
+            system_prompt="""You are PlannerAgent: the CENTRAL PLANNER for a multi-agent coding system.
 
-    def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        # Interpret user request from state
+YOUR ROLE: Create a COMPLETE execution plan UPFRONT in a single response.
+
+Available worker actions (in order of typical use):
+- "analyze": CodeAnalyzer examines the codebase structure
+- "testrunner": Run tests to see current status  
+- "debug": Debugger analyzes failures and creates fix instructions
+- "writer": CodeWriter applies fixes to code
+- "done": Signal that work is complete
+
+IMPORTANT RULES:
+1. You create the ENTIRE plan in ONE response
+2. Workers execute your plan - they cannot modify it
+3. Your plan should be a logical sequence to achieve the goal
+4. Always start with "testrunner" to assess current state
+5. For fixing bugs: testrunner -> debug -> writer -> testrunner
+6. End with "done" when you expect success
+
+You MUST respond with valid JSON:
+{
+  "mode": "debug" or "performance" or "feature",
+  "plan": ["testrunner", "debug", "writer", "testrunner", "done"],
+  "planner_notes": "brief explanation of your plan"
+}""",
+            name="Planner",
+            base_url=base_url
+        )
+
+    def create_plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate the COMPLETE execution plan in ONE LLM call.
+        
+        This is the canonical centralized planner behavior:
+        - One LLM call produces the full plan
+        - Only one agent (this one) decides task ordering
+        """
         user_request = state.get("user_request", "Fix failing tests")
+        max_iterations = state.get("max_iterations", 8)
+        
+        # Get initial context if available
+        files_info = ""
+        try:
+            files = tools.list_files(".")
+            py_files = [f for f in files if f.endswith('.py') and 'env/' not in f and '__pycache__' not in f]
+            files_info = f"Python files in repo: {py_files[:20]}"
+        except Exception:
+            files_info = "Could not list files"
+        
+        prompt = f"""Create a COMPLETE execution plan for this request:
 
-        # If mode already chosen, keep it
-        mode = state.get("mode")
-        if not mode:
-            # Simple selection based on keywords
-            lr = user_request.lower()
-            if "perf" in lr or "optimi" in lr:
-                mode = "performance"
-            elif "feature" in lr or "add" in lr:
-                mode = "feature"
+USER REQUEST: {user_request}
+MAX STEPS ALLOWED: {max_iterations}
+CODEBASE INFO: {files_info}
+
+Based on the request, create a full plan. Common patterns:
+
+For "Fix failing tests" or bug fixing:
+  ["testrunner", "debug", "writer", "testrunner", "done"]
+  
+For "Optimize performance":
+  ["testrunner", "analyze", "profile", "writer", "testrunner", "done"]
+
+For "Add new feature":
+  ["analyze", "writer", "testrunner", "done"]
+
+Create your plan now. Respond with JSON only:
+{{"mode": "...", "plan": [...], "planner_notes": "..."}}"""
+
+        response = self.call_model(prompt)
+        
+        # Parse JSON from response
+        try:
+            if '{' in response:
+                start = response.index('{')
+                end = response.rindex('}') + 1
+                result = json.loads(response[start:end])
             else:
-                mode = "debug"
-
-        # Basic plan: analyze -> write -> test -> (debug loop) or performance path
-        plan = {
-            "mode": mode,
-            "next_action": "analyze",
-            "notes": f"Mode selected: {mode}",
-            "modified_files": state.get("modified_files", []),
-            "iteration": state.get("iteration", 0) + 1,
-            "max_iterations": state.get("max_iterations", 8),
+                # Default plan for bug fixing
+                result = {
+                    "mode": "debug",
+                    "plan": ["testrunner", "debug", "writer", "testrunner", "done"],
+                    "planner_notes": "Default bug-fixing plan (LLM response parsing failed)"
+                }
+        except Exception as e:
+            result = {
+                "mode": "debug", 
+                "plan": ["testrunner", "debug", "writer", "testrunner", "done"],
+                "planner_notes": f"JSON parse error, using default plan: {e}"
+            }
+        
+        # Validate plan
+        valid_actions = {"analyze", "testrunner", "debug", "writer", "profile", "done"}
+        plan = result.get("plan", [])
+        plan = [a for a in plan if a in valid_actions]
+        
+        if not plan:
+            plan = ["testrunner", "debug", "writer", "testrunner", "done"]
+        
+        # Ensure plan doesn't exceed max_iterations
+        if len(plan) > max_iterations:
+            plan = plan[:max_iterations-1] + ["done"]
+        
+        return {
+            "mode": result.get("mode", "debug"),
+            "plan": plan,
+            "plan_index": 0,  # Current position in plan
+            "planner_notes": result.get("planner_notes", ""),
+            "original_plan": plan.copy(),  # Keep original for logging
         }
 
-        # If test results exist, decide next step
-        tr = state.get("last_test_run")
-        if tr:
-            if tr.get("failed", 0) == 0:
-                plan["next_action"] = "done"
-                plan["notes"] = "All tests passing."
+    def should_replan(self, state: Dict[str, Any]) -> bool:
+        """Check if replanning is needed (only on unexpected failures).
+        
+        Replanning happens ONLY in the planner, and only when:
+        - Writer made changes but tests still fail
+        - We've tried the same fix multiple times
+        """
+        replan_count = state.get("replan_count", 0)
+        max_replans = 2  # Limit replanning attempts
+        
+        if replan_count >= max_replans:
+            return False
+        
+        # Check if we just ran tests after a write and tests still fail
+        last_test_run = state.get("last_test_run", {})
+        last_writer_change = state.get("last_writer_change", False)
+        failed = last_test_run.get("failed", 0)
+        
+        # Replan if writer made changes but tests still fail
+        if last_writer_change and failed > 0:
+            return True
+        
+        return False
+
+    def replan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a NEW plan when the original plan didn't work.
+        
+        This is the ONLY place where replanning occurs (in the planner).
+        """
+        user_request = state.get("user_request", "Fix failing tests")
+        last_test_run = state.get("last_test_run", {})
+        replan_count = state.get("replan_count", 0) + 1
+        previous_plan = state.get("original_plan", [])
+        
+        prompt = f"""Your previous plan did not fully succeed. Create a NEW plan.
+
+USER REQUEST: {user_request}
+PREVIOUS PLAN: {previous_plan}
+REPLAN ATTEMPT: {replan_count}
+
+CURRENT TEST STATUS:
+- Total: {last_test_run.get('total_tests', 0)}
+- Failed: {last_test_run.get('failed', 0)}
+- Failing tests: {last_test_run.get('failed_test_names', [])}
+
+Create a new plan to fix remaining issues. Try a different approach.
+Respond with JSON only:
+{{"mode": "...", "plan": [...], "planner_notes": "..."}}"""
+
+        response = self.call_model(prompt)
+        
+        try:
+            if '{' in response:
+                start = response.index('{')
+                end = response.rindex('}') + 1
+                result = json.loads(response[start:end])
+                plan = result.get("plan", ["debug", "writer", "testrunner", "done"])
             else:
-                # Check if we're stuck in a loop (writer not making changes)
-                last_change = state.get("last_writer_change", True)
-                consecutive_failures = state.get("consecutive_no_change", 0)
-                
-                if not last_change:
-                    consecutive_failures += 1
-                    plan["consecutive_no_change"] = consecutive_failures
-                else:
-                    plan["consecutive_no_change"] = 0
-                
-                # If stuck for 2+ iterations, switch strategy
-                if consecutive_failures >= 2:
-                    plan["next_action"] = "stop"
-                    plan["notes"] = f"Stuck: Writer unable to apply fixes after {consecutive_failures} attempts. Debug patterns not matching source code."
-                elif mode == "performance":
-                    plan["next_action"] = "profile"
-                else:
-                    # When tests fail, always go to debugger first to analyze failures
-                    plan["next_action"] = "debug"
-                    plan["notes"] = f"{tr.get('failed', 0)} tests failing - running debugger to analyze."
-
-        # If there are no test results yet, after the first analysis run the tests
-        # so Planner has concrete test data to act upon.
-        if not tr and plan["iteration"] == 1:
-            plan["next_action"] = "testrunner"
-            plan["notes"] = "No test results yet — running tests to get baseline."
-
-        # Termination guard
-        if plan["iteration"] > plan["max_iterations"]:
-            plan["next_action"] = "stop"
-            plan["notes"] = "Reached max iterations"
-
-        # Return planner state patch
+                plan = ["debug", "writer", "testrunner", "done"]
+                result = {"mode": "debug", "planner_notes": "Replan with default"}
+        except Exception:
+            plan = ["debug", "writer", "testrunner", "done"]
+            result = {"mode": "debug", "planner_notes": "Replan parse error"}
+        
         return {
-            "mode": plan["mode"],
-            "planner_notes": plan["notes"],
-            "next_action": plan["next_action"],
-            "iteration": plan["iteration"],
-            "max_iterations": plan["max_iterations"],
+            "mode": result.get("mode", "debug"),
+            "plan": plan,
+            "plan_index": 0,
+            "planner_notes": result.get("planner_notes", ""),
+            "original_plan": plan.copy(),
+            "replan_count": replan_count,
         }
 
 
 class CodeAnalyzerAgent(BaseAgent):
+    """STATELESS WORKER: Analyzes codebase structure.
+    
+    This worker:
+    - Executes the assigned analysis task
+    - Returns results to the planner
+    - Does NOT modify the global plan
+    - Does NOT split/reassign/reject tasks
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="You are CodeAnalyzer: produce a JSON with keys 'summary' and 'files' listing key files to inspect.", name="CodeAnalyzer", base_url=base_url)
 
@@ -219,6 +351,15 @@ class CodeAnalyzerAgent(BaseAgent):
 
 
 class CodeWriterAgent(BaseAgent):
+    """STATELESS WORKER: Applies code fixes based on instructions.
+    
+    This worker:
+    - Executes the assigned fix task
+    - Writes corrected code to files
+    - Does NOT modify the global plan
+    - Does NOT decide what to fix next (that's the planner's job)
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="""You are CodeWriter: an expert at fixing bugs in code.
 
@@ -310,6 +451,15 @@ Keep all existing code structure, imports, and comments. Only fix the specific b
 
 
 class TestRunnerAgent(BaseAgent):
+    """STATELESS WORKER: Runs tests and reports results.
+    
+    This worker:
+    - Executes the test suite
+    - Returns structured test results
+    - Does NOT modify the global plan
+    - Does NOT decide what to do if tests fail (that's the planner's job)
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="You are TestRunner: run the project's tests and return structured JSON exactly as required.", name="TestRunner", base_url=base_url)
 
@@ -329,6 +479,15 @@ class TestRunnerAgent(BaseAgent):
 
 
 class DebuggerAgent(BaseAgent):
+    """STATELESS WORKER: Analyzes test failures and creates fix instructions.
+    
+    This worker:
+    - Analyzes test output to identify bugs
+    - Creates fix instructions for CodeWriter
+    - Does NOT modify the global plan
+    - Does NOT execute fixes (that's CodeWriter's job)
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="""You are DebuggerAgent: an expert at analyzing test failures and diagnosing bugs.
 
@@ -437,6 +596,15 @@ Example good instructions:
 
 
 class PerformanceAnalyzerAgent(BaseAgent):
+    """STATELESS WORKER: Profiles code performance.
+    
+    This worker:
+    - Profiles specified functions
+    - Returns performance metrics
+    - Does NOT modify the global plan
+    - Does NOT decide optimization strategy (that's the planner's job)
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="You are PerformanceAnalyzer: profile a named function and return 'profile' summary.", name="PerformanceAnalyzer", base_url=base_url)
 
