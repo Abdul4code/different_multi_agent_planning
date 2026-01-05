@@ -9,6 +9,7 @@ from langgraph_agents import tools
 
 # Test running tests
 print("Testing test runner...")
+os.makedirs("../agent_benchmark/repo_1_shopping_cart", exist_ok=True)
 os.chdir("../agent_benchmark/repo_1_shopping_cart")
 result = tools.run_tests("pytest -q")
 print(f"Test Results: {result}")
