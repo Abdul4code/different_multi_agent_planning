@@ -80,11 +80,16 @@ def run_agents_async(agents: List, blackboard: Blackboard, max_iterations: int =
     # Monitor progress without controlling agents
     start = time.time()
     last_status = ""
+    goal_achieved = False
     
     while time.time() - start < timeout:
         # Check if goal achieved
         if goal_satisfied(blackboard):
             print("\n✓ Goal satisfied - all tests passing!")
+            goal_achieved = True
+            # Immediately signal all agents to stop
+            for agent in agents:
+                agent.stop()
             break
         
         # Check if all agents stopped
@@ -100,14 +105,15 @@ def run_agents_async(agents: List, blackboard: Blackboard, max_iterations: int =
             print(f"  [{time.time() - start:.1f}s] {status}")
             last_status = status
         
-        time.sleep(0.5)
+        time.sleep(0.25)  # Check more frequently (every 250ms instead of 500ms)
     
     elapsed = time.time() - start
     
-    # Signal agents to stop (if timeout reached)
-    print("\nStopping agents...")
-    for agent in agents:
-        agent.stop()
+    # Signal agents to stop (if timeout reached or not already stopped)
+    if not goal_achieved:
+        print("\nStopping agents...")
+        for agent in agents:
+            agent.stop()
     
     # Collect history from all agents
     all_history = []

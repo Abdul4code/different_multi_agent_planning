@@ -253,7 +253,7 @@ class AutonomousAgent(ABC):
         while self._running and iteration < max_iterations:
             iteration += 1
             
-            # Check stop condition (e.g., goal satisfied)
+            # Check stop condition BEFORE each iteration (e.g., goal satisfied)
             if stop_condition and stop_condition(self.blackboard):
                 self.communicate("agent_stopped", {"reason": "Goal satisfied"})
                 break
@@ -261,6 +261,11 @@ class AutonomousAgent(ABC):
             # Execute one step
             try:
                 result = self.step()
+                
+                # Check stop condition AFTER each action for faster termination
+                if stop_condition and stop_condition(self.blackboard):
+                    self.communicate("agent_stopped", {"reason": "Goal satisfied after action"})
+                    break
                 
                 # Track consecutive waits
                 if result.get("plan", {}).get("action") == "wait":
