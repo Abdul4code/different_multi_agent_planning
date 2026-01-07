@@ -363,6 +363,12 @@ class CodeWriterAgent(BaseAgent):
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="""You are CodeWriter: an expert at fixing bugs in code.
 
+IMPORTANT RULES:
+1. NEVER modify test files (files starting with 'test_' or ending with '_test.py')
+2. Test files define the expected behavior - they are the specification
+3. Your job is to fix the SOURCE code to make the tests pass, not to change the tests
+4. If a test is failing, the bug is in the source code, not in the test
+
 Given a file and instructions about what bugs to fix, you will:
 1. Read and understand the entire file
 2. Identify the buggy lines based on the instructions
@@ -491,13 +497,19 @@ class DebuggerAgent(BaseAgent):
     def __init__(self, base_url: str = "http://localhost:11434/v1"):
         super().__init__(system_prompt="""You are DebuggerAgent: an expert at analyzing test failures and diagnosing bugs.
 
+IMPORTANT RULES:
+1. NEVER suggest modifying test files (files starting with 'test_' or ending with '_test.py')
+2. Test files define the expected behavior - they are the specification
+3. The bug is ALWAYS in the source code, not in the tests
+4. Your fix_instructions must ONLY target source files, never test files
+
 Given test output with failures/errors, you must:
 1. Read the relevant source files to understand the bug
 2. Analyze the error messages and tracebacks
 3. Return a JSON dict with:
    - "analysis": brief description of the root cause
    - "fix_instructions": list of dicts, each with:
-     * "file": path to file
+     * "file": path to SOURCE file (never test files!)
      * "reason": clear description of what bug to fix (e.g., "Remove the + 1.0 from subtotal calculation")
      * "line": approximate line number (optional)
 
