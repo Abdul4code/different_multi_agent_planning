@@ -156,7 +156,7 @@ class AutonomousAgent(ABC):
         observation = {
             "blackboard_summary": self.blackboard.get_summary(),
             "shared_data": self.blackboard.get_all_shared(),
-            "recent_messages": [m.to_dict() for m in self.blackboard.get_messages()[-20:]],
+            "recent_messages": [m.to_dict() for m in self.blackboard.get_messages()[-50:]],
             "my_state": {
                 "beliefs": self.state.beliefs,
                 "goals": self.state.goals,
@@ -240,19 +240,18 @@ class AutonomousAgent(ABC):
         
         Each agent runs independently - this is NOT controlled by a central coordinator.
         
-        Stopping conditions:
-        1. stop_condition returns True (e.g., goal satisfied)
-        2. max_iterations reached
-        3. Too many consecutive waits (agent is stuck)
+        Stopping conditions (ONLY these):
+        1. stop_condition returns True (e.g., all tests pass)
+        2. max_iterations reached (only counts REAL actions, not waits)
+        
+        Agents should NOT stop just because they're waiting - new tasks may arrive.
         """
         self._running = True
-        iteration = 0
+        action_count = 0  # Only count real actions, not waits
         consecutive_waits = 0
-        max_consecutive_waits = 5  # Stop if agent waits 5 times in a row
+        max_consecutive_waits = 30  # Allow up to 30 consecutive waits (30 seconds)
         
-        while self._running and iteration < max_iterations:
-            iteration += 1
-            
+        while self._running:
             # Check stop condition BEFORE each iteration (e.g., goal satisfied)
             if stop_condition and stop_condition(self.blackboard):
                 self.communicate("agent_stopped", {"reason": "Goal satisfied"})
@@ -267,25 +266,32 @@ class AutonomousAgent(ABC):
                     self.communicate("agent_stopped", {"reason": "Goal satisfied after action"})
                     break
                 
-                # Track consecutive waits
+                # If waiting, sleep briefly but DO NOT count as iteration
                 if result.get("plan", {}).get("action") == "wait":
                     consecutive_waits += 1
-                    time.sleep(0.5)
+                    time.sleep(1.0)  # Wait a bit longer before checking again
                     
-                    # Stop if stuck waiting
-                    if consecutive_waits >= max_consecutive_waits:
-                        self.communicate("agent_stopped", {"reason": "No work available (stuck waiting)"})
+                    # Only stop if we've waited too long AND done at least some real work
+                    if consecutive_waits >= max_consecutive_waits and action_count > 0:
+                        self.communicate("agent_stopped", {"reason": f"Waited too long ({consecutive_waits} waits) after {action_count} actions"})
                         break
                 else:
-                    consecutive_waits = 0  # Reset on real action
+                    # Real action - count it and reset wait counter
+                    action_count += 1
+                    consecutive_waits = 0
+                    
+                    # Check if we've done enough real actions
+                    if action_count >= max_iterations:
+                        self.communicate("agent_stopped", {"reason": f"Max actions ({max_iterations}) reached"})
+                        break
                     
             except Exception as e:
                 self.communicate("error", {"error": str(e)})
                 time.sleep(1)
         
-        # Log why we stopped
-        if iteration >= max_iterations:
-            self.communicate("agent_stopped", {"reason": f"Max iterations ({max_iterations}) reached"})
+        # Log why we stopped if loop ended naturally
+        if self._running:
+            self.communicate("agent_stopped", {"reason": "Loop ended"})
         
         self._running = False
         return self.state.action_history
@@ -610,12 +616,25 @@ Respond with JSON only."""
         except Exception:
             pass
         
-        # Default logic
+        # Default logic - be MORE aggressive about debugging
         test_results = shared.get("test_results", {})
-        if test_results.get("failed", 0) > 0 and not self.state.beliefs.get("fixes_suggested"):
-            return {"action": "debug", "reason": "Tests failing, need to diagnose", "details": {}}
+        failed = test_results.get("failed", 0)
         
-        return {"action": "wait", "reason": "No failures to debug", "details": {}}
+        # Check if fixes have been applied by looking at modified files
+        modified_files = shared.get("modified_files", [])
+        
+        if failed > 0:
+            # Debug if we haven't suggested fixes yet
+            if not self.state.beliefs.get("fixes_suggested"):
+                return {"action": "debug", "reason": "Tests failing, need to diagnose", "details": {}}
+            
+            # Re-debug if fixes were applied but tests still fail (may need different fix)
+            if modified_files and self.state.beliefs.get("last_modified_count", 0) != len(modified_files):
+                self.state.beliefs["last_modified_count"] = len(modified_files)
+                self.state.beliefs["fixes_suggested"] = False  # Reset to allow new analysis
+                return {"action": "debug", "reason": "Previous fix didn't work, re-analyzing", "details": {}}
+        
+        return {"action": "wait", "reason": "No failures to debug or waiting for fix results", "details": {}}
     
     def act(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the planned action."""
@@ -643,6 +662,14 @@ Respond with JSON only."""
         
         source_files = list(set(f[0] for f in file_mentions if not f[0].startswith('test_')))
         
+        # Also get source files from code analysis if available
+        code_analysis = self.blackboard.get_shared("code_analysis", {})
+        analyzed_source_files = code_analysis.get("source_files", [])
+        for sf in analyzed_source_files:
+            basename = os.path.basename(sf) if '/' in sf else sf
+            if basename not in source_files and not basename.startswith('test_'):
+                source_files.append(sf)
+        
         # Read source files
         file_contents = {}
         for fpath in source_files[:3]:
@@ -654,11 +681,17 @@ Respond with JSON only."""
         # Use LLM to analyze
         system_prompt = """Analyze test failures and identify bugs.
 
+IMPORTANT RULES:
+1. NEVER suggest modifying test files (files starting with 'test_' or ending with '_test.py')
+2. Test files define the expected behavior - they are the specification
+3. The bug is ALWAYS in the source code, not in the tests
+4. Your fixes must ONLY target source files, never test files
+
 Return JSON:
 {
   "analysis": "root cause description",
   "fixes": [
-    {"file": "path.py", "reason": "what to fix", "line": 50}
+    {"file": "source_file.py", "reason": "what to fix", "line": 50}
   ]
 }"""
         
@@ -717,13 +750,13 @@ class CodeWriterAgent(AutonomousAgent):
     
     def plan(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         """Decide whether to apply fixes."""
-        messages = observation["recent_messages"]
+        # Get ALL task_available messages from blackboard, not just recent ones
+        all_task_messages = self.blackboard.get_messages(msg_type="task_available")
         
-        # Look for fix tasks
-        fix_tasks = [m for m in messages 
-                    if m.get("msg_type") == "task_available" 
-                    and m.get("content", {}).get("task_type") == "apply_fix"
-                    and m.get("content", {}).get("suggested_for") == "CodeWriter"]
+        # Look for fix tasks for CodeWriter
+        fix_tasks = [m.to_dict() for m in all_task_messages 
+                    if m.content.get("task_type") == "apply_fix"
+                    and m.content.get("suggested_for") == "CodeWriter"]
         
         # Filter out tasks we've already done
         pending_fixes = []
@@ -735,9 +768,15 @@ class CodeWriterAgent(AutonomousAgent):
         system_prompt = """You are an autonomous CodeWriter agent in a decentralized system.
 You decide when to apply code fixes.
 
+IMPORTANT RULES:
+1. NEVER modify test files (files starting with 'test_' or ending with '_test.py')
+2. Test files define the expected behavior - they are the specification
+3. Your job is to fix the SOURCE code to make the tests pass, not to change the tests
+4. If a fix task targets a test file, SKIP IT and explain why
+
 You can:
-1. "apply_fix" - Apply a suggested fix to a file
-2. "wait" - Do nothing if there are no valid fixes
+1. "apply_fix" - Apply a suggested fix to a SOURCE file (never test files)
+2. "wait" - Do nothing if there are no valid fixes or only test file fixes
 
 Respond with JSON:
 {
@@ -780,7 +819,28 @@ What should I do?"""
                 }
             }
         
-        return {"action": "wait", "reason": "No pending fixes", "details": {}}
+        # FALLBACK: If no explicit fix tasks but tests are failing, try to fix proactively
+        shared = observation["shared_data"]
+        test_results = shared.get("test_results", {})
+        code_analysis = shared.get("code_analysis", {})
+        
+        if test_results.get("failed", 0) > 0 and code_analysis.get("source_files"):
+            # There are failing tests and we know about source files
+            source_files = [f for f in code_analysis.get("source_files", []) 
+                          if not f.startswith('test_') and not f.endswith('_test.py')]
+            if source_files and not self.state.beliefs.get("proactive_fix_attempted"):
+                self.state.beliefs["proactive_fix_attempted"] = True
+                return {
+                    "action": "apply_fix",
+                    "reason": "Proactively fixing based on test failures",
+                    "details": {
+                        "fix_task_id": "proactive",
+                        "file": source_files[0],
+                        "reason": f"Fix failing tests: {test_results.get('raw', '')[:500]}"
+                    }
+                }
+        
+        return {"action": "wait", "reason": "No pending fixes, waiting for Debugger", "details": {}}
     
     def act(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the planned action."""
@@ -806,7 +866,14 @@ What should I do?"""
             return {"status": "error", "reason": f"Could not read {filepath}: {e}"}
         
         # Use LLM to generate fix
-        system_prompt = """Fix the bug in this file. 
+        system_prompt = """Fix the bug in this file.
+
+IMPORTANT RULES:
+1. NEVER modify test files (files starting with 'test_' or ending with '_test.py')
+2. Test files define the expected behavior - they are the specification
+3. Your job is to fix the SOURCE code to make the tests pass, not to change the tests
+4. If a test is failing, the bug is in the source code, not in the test
+
 Output ONLY the complete corrected Python code, no explanations."""
         
         user_prompt = f"""FILE: {filepath}
@@ -846,16 +913,19 @@ Output the complete corrected file:"""
         if task_id:
             self.state.commitments.append(task_id)
         
+        # Reset proactive fix flag to allow retry if needed
+        self.state.beliefs["proactive_fix_attempted"] = False
+        
         # Notify others that code changed
         self.communicate("code_modified", {
             "file": filepath,
             "reason": reason
         })
         
-        # Reset debugger's beliefs (they need to re-analyze if tests fail)
+        # Request test run to verify fix
         self.communicate("task_available", {
             "task_type": "run_tests",
-            "reason": f"Code modified in {filepath}",
+            "reason": f"Code modified in {filepath}, need to verify fix",
             "suggested_for": "TestRunner"
         })
         
