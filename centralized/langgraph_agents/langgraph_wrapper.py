@@ -43,14 +43,14 @@ class PlanExecutor:
         self.workers[node.name] = node
     
     def execute_plan(self, plan: List[str], initial_state: Dict[str, Any], 
-                     planner=None, max_replans: int = 2) -> Dict[str, Any]:
+                     planner=None, max_iterations: int = 50) -> Dict[str, Any]:
         """Execute the plan sequentially.
         
         Args:
             plan: List of task names to execute (e.g., ["testrunner", "debug", "writer"])
             initial_state: Initial state dictionary
             planner: PlannerAgent instance for replanning if needed
-            max_replans: Maximum number of times to replan
+            max_iterations: Maximum total iterations allowed (safety limit)
             
         Returns:
             Dict with 'state' and 'history' keys
@@ -66,16 +66,50 @@ class PlanExecutor:
         
         while state["plan_index"] < len(current_plan):
             iteration += 1
-            task = current_plan[state["plan_index"]]
             
-            # Check for "done" signal
-            if task == "done":
+            # Check max iterations limit (safety timeout)
+            if iteration > max_iterations:
                 history.append({
                     "iteration": iteration,
-                    "node": "done",
-                    "output": {"status": "Plan completed successfully"}
+                    "node": "max_iterations_reached",
+                    "output": {"status": f"Stopped: max iterations ({max_iterations}) reached"}
                 })
                 break
+            
+            task = current_plan[state["plan_index"]]
+            
+            # Check for "done" signal - but only stop if all tests pass
+            if task == "done":
+                last_test_run = state.get("last_test_run", {})
+                failed = last_test_run.get("failed", 0)
+                total = last_test_run.get("total_tests", 0)
+                
+                # Only truly done if all tests pass
+                if failed == 0 and total > 0:
+                    history.append({
+                        "iteration": iteration,
+                        "node": "done",
+                        "output": {"status": "All tests passed - completed successfully"}
+                    })
+                    break
+                else:
+                    # Tests still failing - replan instead of stopping
+                    if planner is not None:
+                        replan_result = planner.replan(state)
+                        state.update(replan_result)
+                        current_plan = replan_result.get("plan", ["debug", "writer", "testrunner", "done"])
+                        state["plan_index"] = 0
+                        history.append({
+                            "iteration": iteration,
+                            "node": "planner_replan",
+                            "output": replan_result
+                        })
+                        continue
+                    else:
+                        # No planner available, just continue with default
+                        current_plan = ["debug", "writer", "testrunner", "done"]
+                        state["plan_index"] = 0
+                        continue
             
             # Execute the worker task
             worker = self.workers.get(task)
@@ -105,31 +139,14 @@ class PlanExecutor:
             # Move to next task in plan
             state["plan_index"] += 1
             
-            # Check if replanning is needed (ONLY after testrunner following a write)
-            if task == "testrunner" and planner is not None:
+            # Check if all tests pass after testrunner - if so, we're done!
+            if task == "testrunner":
                 last_test_run = state.get("last_test_run", {})
                 failed = last_test_run.get("failed", 0)
-                last_writer_change = state.get("last_writer_change", False)
+                total = last_test_run.get("total_tests", 0)
                 
-                # Replan only if: we're at end of plan, writer made changes, but tests still fail
-                at_end_of_plan = state["plan_index"] >= len(current_plan) - 1
-                should_replan = (at_end_of_plan and last_writer_change and 
-                                failed > 0 and state["replan_count"] < max_replans)
-                
-                if should_replan:
-                    # REPLANNING: Only the planner can create a new plan
-                    replan_result = planner.replan(state)
-                    state.update(replan_result)
-                    current_plan = replan_result.get("plan", ["done"])
-                    state["plan_index"] = 0
-                    
-                    history.append({
-                        "iteration": iteration,
-                        "node": "planner_replan",
-                        "output": replan_result
-                    })
-                elif failed == 0 and last_test_run.get("total_tests", 0) > 0:
-                    # Tests pass - we're done!
+                if failed == 0 and total > 0:
+                    # All tests pass - we're done!
                     history.append({
                         "iteration": iteration + 1,
                         "node": "done",
@@ -184,7 +201,7 @@ class StateGraph:
                 plan=plan,
                 initial_state=state,
                 planner=planner,
-                max_replans=2
+                max_iterations=max_iters
             )
         
         # LEGACY MODE: Edge-based execution (for backward compatibility)
